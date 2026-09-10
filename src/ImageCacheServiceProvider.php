@@ -1,5 +1,7 @@
 <?php
 
+declare(strict_types=1);
+
 namespace JeffersonGoncalves\ImageCache;
 
 use Spatie\LaravelPackageTools\Package;
@@ -11,8 +13,6 @@ class ImageCacheServiceProvider extends PackageServiceProvider
     {
         $package
             ->name('laravel-image-cache')
-            ->hasConfigFile()
-            ->hasViews()
-            ->hasMigrations();
+            ->hasConfigFile();
     }
 }

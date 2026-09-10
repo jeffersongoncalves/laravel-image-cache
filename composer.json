@@ -20,11 +20,12 @@
         }
     ],
     "require": {
-        "php": "^8.2",
+        "php": "^8.3",
         "spatie/laravel-package-tools": "^1.16",
         "illuminate/http": "^12.0|^13.0",
         "illuminate/support": "^12.0|^13.0",
-        "jeffersongoncalves/laravel-ssrf-guard": "^1.1"
+        "jeffersongoncalves/laravel-ssrf-guard": "^1.1",
+        "symfony/http-foundation": "^7.0|^8.0"
     },
     "require-dev": {
         "larastan/larastan": "^3.0",
@@ -61,10 +62,7 @@
         "laravel": {
             "providers": [
                 "JeffersonGoncalves\\ImageCache\\ImageCacheServiceProvider"
-            ],
-            "aliases": {
-                "ImageCache": "JeffersonGoncalves\\ImageCache\\Facades\\ImageCache"
-            }
+            ]
         }
     },
     "minimum-stability": "dev",

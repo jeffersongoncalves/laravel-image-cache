@@ -1,3 +1,5 @@
 <?php
 
-uses(JeffersonGoncalves\ImageCache\Tests\TestCase::class)->in('Feature', 'Unit');
+use JeffersonGoncalves\ImageCache\Tests\TestCase;
+
+uses(TestCase::class)->in(__DIR__);
