@@ -78,6 +78,10 @@ class ImageCache
             return true;
         }
 
+        if ($this->recentlyFailed($key)) {
+            return false;
+        }
+
         if ($resolve === null) {
             $resolve = app(SsrfGuard::class)->resolveEntries($url);
 
@@ -89,18 +93,49 @@ class ImageCache
         }
 
         $fetched = $this->fetch($url, $resolve);
-
-        if ($fetched === null) {
-            return false;
-        }
-
         $disk = Storage::disk($this->disk);
         $path = $this->path($key);
 
+        if ($fetched === null) {
+            // Negative cache: a missing upstream image (e.g. a README pointing
+            // at a deleted file) would otherwise be re-fetched on every request.
+            $disk->put($path.'.failed', (string) now()->timestamp);
+
+            return false;
+        }
+
         $disk->put($path, $fetched['body']);
         $disk->put($path.'.type', $fetched['type']);
+        $disk->delete($path.'.failed');
 
         return true;
+    }
+
+    /**
+     * Whether the last fetch for this key failed less than
+     * `image-cache.failure_ttl` seconds ago (0 disables the negative cache).
+     */
+    public function recentlyFailed(string $key): bool
+    {
+        $ttl = (int) config('image-cache.failure_ttl', 3600);
+        $disk = Storage::disk($this->disk);
+        $marker = $this->path($key).'.failed';
+
+        return $ttl > 0
+            && $disk->exists($marker)
+            && $disk->lastModified($marker) >= now()->subSeconds($ttl)->timestamp;
+    }
+
+    /**
+     * A 1x1 transparent GIF, for callers that would rather not answer an
+     * <img> with a 404 when an image could not be fetched.
+     */
+    public static function placeholder(): Response
+    {
+        return new Response((string) base64_decode('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'), 200, [
+            'Content-Type' => 'image/gif',
+            'X-Content-Type-Options' => 'nosniff',
+        ]);
     }
 
     /**

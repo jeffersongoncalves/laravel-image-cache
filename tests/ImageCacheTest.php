@@ -152,3 +152,45 @@ it('returns a ready-to-send response for a warmed key', function () {
 it('returns null response for a never-warmed key', function () {
     expect(makeImageCache()->response('missing'))->toBeNull();
 });
+
+it('skips the upstream after a failed fetch until the failure ttl passes', function () {
+    Http::fake([
+        'https://1.1.1.1/*' => Http::sequence()
+            ->push('', 404)
+            ->push('binary-image-data', 200, ['Content-Type' => 'image/png']),
+    ]);
+
+    $cache = makeImageCache();
+
+    expect($cache->warm('photo', 'https://1.1.1.1/photo.png'))->toBeFalse()
+        ->and($cache->recentlyFailed('photo'))->toBeTrue()
+        ->and($cache->warm('photo', 'https://1.1.1.1/photo.png'))->toBeFalse();
+
+    Http::assertSentCount(1);
+
+    touch(Storage::disk('images')->path('cache/photo.failed'), time() - 3601);
+
+    expect($cache->warm('photo', 'https://1.1.1.1/photo.png'))->toBeTrue();
+
+    Storage::disk('images')->assertMissing('cache/photo.failed');
+});
+
+it('retries every time when the failure ttl is 0', function () {
+    config()->set('image-cache.failure_ttl', 0);
+    Http::fake(['https://1.1.1.1/*' => Http::response('', 404)]);
+
+    $cache = makeImageCache();
+    $cache->warm('photo', 'https://1.1.1.1/photo.png');
+    $cache->warm('photo', 'https://1.1.1.1/photo.png');
+
+    Http::assertSentCount(2);
+});
+
+it('builds a transparent gif placeholder response', function () {
+    $response = ImageCache::placeholder();
+
+    expect($response->getStatusCode())->toBe(200)
+        ->and($response->headers->get('Content-Type'))->toBe('image/gif')
+        ->and($response->headers->get('X-Content-Type-Options'))->toBe('nosniff')
+        ->and(str_starts_with((string) $response->getContent(), 'GIF89a'))->toBeTrue();
+});

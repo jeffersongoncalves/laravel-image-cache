@@ -23,4 +23,16 @@ return [
     |
     */
     'max_redirects' => (int) env('IMAGE_CACHE_MAX_REDIRECTS', 3),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Failure TTL
+    |--------------------------------------------------------------------------
+    |
+    | After a failed fetch (404, non-image, network error...), warm() skips the
+    | upstream for this many seconds instead of retrying on every request.
+    | Set to 0 to retry every time.
+    |
+    */
+    'failure_ttl' => (int) env('IMAGE_CACHE_FAILURE_TTL', 3600),
 ];

@@ -44,6 +44,7 @@ This is the published config file:
 return [
     'timeout' => (int) env('IMAGE_CACHE_TIMEOUT', 8),
     'max_redirects' => (int) env('IMAGE_CACHE_MAX_REDIRECTS', 3),
+    'failure_ttl' => (int) env('IMAGE_CACHE_FAILURE_TTL', 3600),
 ];
 ```
 
@@ -59,7 +60,7 @@ $cache = new ImageCache(disk: 'public', pathPrefix: 'og-images', ttlSeconds: 864
 
 ### Warming the cache
 
-`warm()` fetches and persists the image if the disk copy is missing or older than the TTL. It no-ops (returns `true`) when already fresh, and **never throws** — any failure (network error, non-2xx, non-image content type, a redirect into a non-public host) is logged as a warning and `false` is returned, leaving any existing stale copy untouched. Serving yesterday's copy beats erroring:
+`warm()` fetches and persists the image if the disk copy is missing or older than the TTL. It no-ops (returns `true`) when already fresh, and **never throws** — any failure (network error, non-2xx, non-image content type, a redirect into a non-public host) is logged as a warning and `false` is returned, leaving any existing stale copy untouched. Serving yesterday's copy beats erroring. A failed fetch is also remembered for `failure_ttl` seconds (`recentlyFailed($key)`), so an upstream that is gone is not hit again on every request:
 
 ```php
 $cache->warm(key: 'project-42', url: $project->social_image);
@@ -97,12 +98,19 @@ public function show(string $slug)
 }
 ```
 
+For an `<img>` you would rather not break, answer with a 1x1 transparent GIF instead of a 404:
+
+```php
+return $cache->response($key) ?? ImageCache::placeholder();
+```
+
 ## Configuration
 
 | Key | Default | Description |
 |-----|---------|-------------|
 | `timeout` | `8` | Maximum seconds a `warm()` fetch may run. |
 | `max_redirects` | `3` | How many redirect hops to follow — each one is re-validated against `SsrfGuard`. |
+| `failure_ttl` | `3600` | Seconds `warm()` skips the upstream after a failed fetch (`0` retries every time). |
 
 ## Testing
 
