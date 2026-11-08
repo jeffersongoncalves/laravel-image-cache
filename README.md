@@ -45,6 +45,7 @@ return [
     'timeout' => (int) env('IMAGE_CACHE_TIMEOUT', 8),
     'max_redirects' => (int) env('IMAGE_CACHE_MAX_REDIRECTS', 3),
     'failure_ttl' => (int) env('IMAGE_CACHE_FAILURE_TTL', 3600),
+    'max_bytes' => (int) env('IMAGE_CACHE_MAX_BYTES', 10 * 1024 * 1024),
 ];
 ```
 
@@ -111,6 +112,7 @@ return $cache->response($key) ?? ImageCache::placeholder();
 | `timeout` | `8` | Maximum seconds a `warm()` fetch may run. |
 | `max_redirects` | `3` | How many redirect hops to follow — each one is re-validated against `SsrfGuard`. |
 | `failure_ttl` | `3600` | Seconds `warm()` skips the upstream after a failed fetch (`0` retries every time). |
+| `max_bytes` | `10485760` | Largest image (bytes) `warm()` stores; bigger ones abort mid-download and count as a failed fetch (`0` = unlimited). |
 
 ## Testing
 

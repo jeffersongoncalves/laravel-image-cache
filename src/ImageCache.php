@@ -184,9 +184,18 @@ class ImageCache
      */
     private function fetch(string $url, array $resolve): ?array
     {
+        $maxBytes = $this->maxBytes();
+
         try {
             $response = Http::timeout($this->timeout())->withOptions([
                 'curl' => [CURLOPT_RESOLVE => $resolve],
+                // Abort mid-transfer: $total is the Content-Length when sent,
+                // $downloaded catches a missing or lying header.
+                'progress' => function (int $total, int $downloaded) use ($maxBytes): void {
+                    if ($maxBytes > 0 && max($total, $downloaded) > $maxBytes) {
+                        throw new RuntimeException('ImageCache fetch exceeded max_bytes ('.$maxBytes.')');
+                    }
+                },
                 // Follow redirects but re-validate every hop: the
                 // CURLOPT_RESOLVE pin only covers the first host, so without
                 // this a public host could redirect to an internal one and
@@ -226,10 +235,29 @@ class ImageCache
             return null;
         }
 
+        // ponytail: the progress callback above only runs under the real curl
+        // handler; this re-check covers Http::fake() and any other handler.
+        $body = $response->body();
+
+        if ($maxBytes > 0 && max((int) $response->header('Content-Length'), strlen($body)) > $maxBytes) {
+            Log::warning('ImageCache rejected oversized upstream', ['url' => $url, 'max_bytes' => $maxBytes]);
+
+            return null;
+        }
+
         return [
-            'body' => $response->body(),
+            'body' => $body,
             'type' => $type,
         ];
+    }
+
+    private function maxBytes(): int
+    {
+        $default = 10 * 1024 * 1024;
+        $max = (int) config('image-cache.max_bytes', $default);
+
+        // 0 means unlimited; a negative typo must not silently mean the same.
+        return $max < 0 ? $default : $max;
     }
 
     private function timeout(): int
