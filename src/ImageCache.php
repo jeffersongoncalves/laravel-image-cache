@@ -4,10 +4,13 @@ declare(strict_types=1);
 
 namespace JeffersonGoncalves\ImageCache;
 
+use Illuminate\Contracts\Cache\Repository;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use JeffersonGoncalves\SsrfGuard\SsrfGuard;
+use League\Flysystem\FilesystemException;
 use RuntimeException;
 use Symfony\Component\HttpFoundation\Response;
 use Throwable;
@@ -51,11 +54,22 @@ class ImageCache
      */
     public function isFresh(string $key): bool
     {
-        $disk = Storage::disk($this->disk);
-        $path = $this->path($key);
+        $cacheKey = $this->cacheKey($key).':until';
 
-        return $disk->exists($path)
-            && $disk->lastModified($path) >= now()->subSeconds($this->ttlSeconds)->timestamp;
+        if ((int) $this->cache()->get($cacheKey) > now()->timestamp) {
+            return true;
+        }
+
+        $until = $this->lastModified($this->path($key)) + $this->ttlSeconds;
+
+        if ($until < now()->timestamp) {
+            return false;
+        }
+
+        // Remember it so the next request skips the HEAD on a remote disk.
+        $this->cache()->put($cacheKey, $until, $until - now()->timestamp);
+
+        return true;
     }
 
     /**
@@ -112,8 +126,12 @@ class ImageCache
             $disk->put($this->blobPath($hash), $fetched['body']);
         }
 
-        $disk->put($path, (string) json_encode(['blob' => $hash, 'type' => $fetched['type']]));
+        $pointer = ['blob' => $hash, 'type' => $fetched['type']];
+        $disk->put($path, (string) json_encode($pointer));
         $disk->delete([$path.'.type', $path.'.failed']);
+
+        $this->cache()->put($this->cacheKey($key).':until', now()->timestamp + $this->ttlSeconds, $this->ttlSeconds);
+        $this->cache()->put($this->cacheKey($key).':ptr', $pointer, $this->ttlSeconds);
 
         return true;
     }
@@ -125,12 +143,9 @@ class ImageCache
     public function recentlyFailed(string $key): bool
     {
         $ttl = (int) config('image-cache.failure_ttl', 3600);
-        $disk = Storage::disk($this->disk);
-        $marker = $this->path($key).'.failed';
 
         return $ttl > 0
-            && $disk->exists($marker)
-            && $disk->lastModified($marker) >= now()->subSeconds($ttl)->timestamp;
+            && $this->lastModified($this->path($key).'.failed') >= now()->subSeconds($ttl)->timestamp;
     }
 
     /**
@@ -153,33 +168,49 @@ class ImageCache
      */
     public function get(string $key): ?array
     {
-        $disk = Storage::disk($this->disk);
+        // Read straight away and treat null as a miss: an exists() first would
+        // be an extra billed round trip on S3/R2. With the pointer in the
+        // Laravel cache, a hit is a single disk read (the blob).
         $path = $this->path($key);
+        $ptrKey = $this->cacheKey($key).':ptr';
+        /** @var array{blob: string, type: string}|null $pointer */
+        $pointer = $this->cache()->get($ptrKey);
+        $entry = null;
 
-        if (! $disk->exists($path)) {
-            return null;
+        if ($pointer === null) {
+            $entry = $this->read($path);
+
+            if ($entry === null) {
+                return null;
+            }
+
+            $pointer = $this->decodePointer($entry);
+
+            if ($pointer !== null) {
+                $this->cache()->put($ptrKey, $pointer, $this->ttlSeconds);
+            }
         }
 
-        $entry = (string) $disk->get($path);
-        $pointer = $this->decodePointer($entry);
-
         if ($pointer !== null) {
-            $blob = $this->blobPath($pointer['blob']);
+            $body = $this->read($this->blobPath($pointer['blob']));
 
-            return $disk->exists($blob)
-                ? ['body' => (string) $disk->get($blob), 'type' => $pointer['type']]
-                : null;
+            if ($body === null) {
+                // Blob gone (pruned, wiped, lifecycle rule): drop the broken
+                // pointer so the next warm() re-fetches instead of no-oping.
+                $this->cache()->forget($ptrKey);
+                $this->cache()->forget($this->cacheKey($key).':until');
+                Storage::disk($this->disk)->delete($path);
+
+                return null;
+            }
+
+            return ['body' => $body, 'type' => $pointer['type']];
         }
 
         // Legacy layout (body + `.type` sidecar), kept readable until the key is re-warmed.
-        if (! $disk->exists($path.'.type')) {
-            return null;
-        }
+        $type = $this->read($path.'.type');
 
-        return [
-            'body' => $entry,
-            'type' => (string) $disk->get($path.'.type'),
-        ];
+        return $type === null ? null : ['body' => (string) $entry, 'type' => $type];
     }
 
     /**
@@ -222,6 +253,40 @@ class ImageCache
     private function blobPath(string $hash): string
     {
         return $this->path('blobs/'.$hash);
+    }
+
+    private function cache(): Repository
+    {
+        return Cache::store(config('image-cache.cache_store'));
+    }
+
+    private function cacheKey(string $key): string
+    {
+        return 'image-cache:'.$this->disk.':'.$this->path($key);
+    }
+
+    /**
+     * One GET; null when missing, also on disks configured with `throw => true`.
+     */
+    private function read(string $path): ?string
+    {
+        try {
+            return Storage::disk($this->disk)->get($path);
+        } catch (FilesystemException) {
+            return null;
+        }
+    }
+
+    /**
+     * One HEAD; 0 when missing, instead of exists() + lastModified().
+     */
+    private function lastModified(string $path): int
+    {
+        try {
+            return Storage::disk($this->disk)->lastModified($path);
+        } catch (FilesystemException) {
+            return 0;
+        }
     }
 
     /**

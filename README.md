@@ -45,6 +45,7 @@ return [
     'timeout' => (int) env('IMAGE_CACHE_TIMEOUT', 8),
     'max_redirects' => (int) env('IMAGE_CACHE_MAX_REDIRECTS', 3),
     'failure_ttl' => (int) env('IMAGE_CACHE_FAILURE_TTL', 3600),
+    'cache_store' => env('IMAGE_CACHE_STORE'),
 ];
 ```
 
@@ -123,6 +124,11 @@ Using a bucket lifecycle rule on a remote disk instead? Never expire `<prefix>/b
 | `timeout` | `8` | Maximum seconds a `warm()` fetch may run. |
 | `max_redirects` | `3` | How many redirect hops to follow — each one is re-validated against `SsrfGuard`. |
 | `failure_ttl` | `3600` | Seconds `warm()` skips the upstream after a failed fetch (`0` retries every time). |
+| `cache_store` | `null` | Laravel cache store remembering each key's "fresh until" time and pointer (`null` = default store, `array` = off). |
+
+### Remote disks (S3, R2)
+
+Every disk call on a remote disk is a billed round trip, so a fresh hit (`warm()` + `response()`) costs **one** read — the image itself. The key's "fresh until" time and pointer are remembered in the Laravel cache (`cache_store`; use a shared store such as Redis when you run several servers), reads never do an `exists()` first, and the `.failed` marker is only checked after a miss. The flip side: freshness is decided by that cache, so a file you age or delete by hand on the disk is not noticed until the TTL runs out (a deleted blob is, on the next read).
 
 ## Testing
 

@@ -35,4 +35,17 @@ return [
     |
     */
     'failure_ttl' => (int) env('IMAGE_CACHE_FAILURE_TTL', 3600),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Cache Store
+    |--------------------------------------------------------------------------
+    |
+    | Laravel cache store that remembers each key's "fresh until" time and
+    | pointer, so a hit on a remote disk (S3/R2) costs a single read instead
+    | of several billed round trips. null = the app's default store; "array"
+    | effectively turns it off.
+    |
+    */
+    'cache_store' => env('IMAGE_CACHE_STORE'),
 ];

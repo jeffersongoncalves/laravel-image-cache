@@ -1,5 +1,7 @@
 <?php
 
+use Illuminate\Filesystem\FilesystemAdapter;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Storage;
 use JeffersonGoncalves\ImageCache\ImageCache;
@@ -129,6 +131,7 @@ it('reports freshness based on the configured ttl', function () {
     expect($cache->isFresh('photo'))->toBeTrue();
 
     touch(Storage::disk('images')->path('cache/photo'), time() - 120);
+    Cache::flush(); // isFresh() remembered "fresh until"; we aged the file behind its back
 
     expect($cache->isFresh('photo'))->toBeFalse();
 });
@@ -226,6 +229,7 @@ it('prunes only old blobs no key points at', function () {
     $cache = makeImageCache();
     $cache->warm('photo', 'https://1.1.1.1/photo.png');
     touch($disk->path('cache/photo'), time() - 90000);
+    Cache::flush();
     $cache->warm('photo', 'https://1.1.1.1/photo.png');
 
     $old = 'cache/blobs/'.hash('sha256', 'old-bytes');
@@ -240,6 +244,74 @@ it('prunes only old blobs no key points at', function () {
     $disk->assertMissing($old);
     $disk->assertExists($new);
     expect($cache->get('photo')['body'])->toBe('new-bytes');
+});
+
+/**
+ * Swap the 'images' disk for one that records every read-side call.
+ *
+ * @return ArrayObject<int, string>
+ */
+function spyOnImagesDisk(): ArrayObject
+{
+    $calls = new ArrayObject;
+    $fake = Storage::disk('images');
+
+    Storage::set('images', new class($fake->getDriver(), $fake->getAdapter(), $fake->getConfig(), $calls) extends FilesystemAdapter
+    {
+        public function __construct($driver, $adapter, $config, private ArrayObject $calls)
+        {
+            parent::__construct($driver, $adapter, $config);
+        }
+
+        public function exists($path): bool
+        {
+            $this->calls[] = 'exists '.$path;
+
+            return parent::exists($path);
+        }
+
+        public function get($path): ?string
+        {
+            $this->calls[] = 'get '.$path;
+
+            return parent::get($path);
+        }
+
+        public function lastModified($path): int
+        {
+            $this->calls[] = 'lastModified '.$path;
+
+            return parent::lastModified($path);
+        }
+    });
+
+    return $calls;
+}
+
+it('serves a fresh hit with a single disk read', function () {
+    Http::fake(['https://1.1.1.1/*' => Http::response('binary-image-data', 200, ['Content-Type' => 'image/png'])]);
+
+    $cache = makeImageCache();
+    $cache->warm('photo', 'https://1.1.1.1/photo.png');
+
+    $calls = spyOnImagesDisk();
+
+    expect($cache->warm('photo', 'https://1.1.1.1/photo.png'))->toBeTrue()
+        ->and($cache->response('photo')->getContent())->toBe('binary-image-data')
+        ->and($calls->getArrayCopy())->toBe(['get cache/blobs/'.hash('sha256', 'binary-image-data')]);
+});
+
+it('drops a pointer whose blob is gone so the next warm re-fetches', function () {
+    Http::fake(['https://1.1.1.1/*' => Http::response('binary-image-data', 200, ['Content-Type' => 'image/png'])]);
+
+    $cache = makeImageCache();
+    $cache->warm('photo', 'https://1.1.1.1/photo.png');
+    Storage::disk('images')->delete('cache/blobs/'.hash('sha256', 'binary-image-data'));
+
+    expect($cache->get('photo'))->toBeNull()
+        ->and($cache->isFresh('photo'))->toBeFalse()
+        ->and($cache->warm('photo', 'https://1.1.1.1/photo.png'))->toBeTrue()
+        ->and($cache->get('photo')['body'])->toBe('binary-image-data');
 });
 
 it('builds a transparent gif placeholder response', function () {
