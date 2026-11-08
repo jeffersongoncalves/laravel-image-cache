@@ -186,6 +186,41 @@ it('retries every time when the failure ttl is 0', function () {
     Http::assertSentCount(2);
 });
 
+it('rejects an image whose Content-Length is above max_bytes', function () {
+    config()->set('image-cache.max_bytes', 10);
+    Http::fake(['https://1.1.1.1/*' => Http::response('small', 200, ['Content-Type' => 'image/png', 'Content-Length' => '999'])]);
+
+    $cache = makeImageCache();
+
+    expect($cache->warm('photo', 'https://1.1.1.1/photo.png'))->toBeFalse();
+
+    Storage::disk('images')->assertMissing('cache/photo');
+    Storage::disk('images')->assertExists('cache/photo.failed');
+});
+
+it('rejects a body above max_bytes without a Content-Length', function () {
+    config()->set('image-cache.max_bytes', 10);
+    Http::fake(['https://1.1.1.1/*' => Http::response(str_repeat('x', 11), 200, ['Content-Type' => 'image/png'])]);
+
+    $cache = makeImageCache();
+
+    expect($cache->warm('photo', 'https://1.1.1.1/photo.png'))->toBeFalse();
+
+    Storage::disk('images')->assertMissing('cache/photo');
+});
+
+it('stores a body under max_bytes, and any size when max_bytes is 0', function () {
+    config()->set('image-cache.max_bytes', 10);
+    Http::fake(['https://1.1.1.1/*' => Http::response('0123456789', 200, ['Content-Type' => 'image/png'])]);
+
+    expect(makeImageCache()->warm('photo', 'https://1.1.1.1/photo.png'))->toBeTrue();
+
+    config()->set('image-cache.max_bytes', 0);
+    Http::fake(['https://1.1.1.1/*' => Http::response(str_repeat('x', 100), 200, ['Content-Type' => 'image/png'])]);
+
+    expect(makeImageCache()->warm('big', 'https://1.1.1.1/big.png'))->toBeTrue();
+});
+
 it('builds a transparent gif placeholder response', function () {
     $response = ImageCache::placeholder();
 
