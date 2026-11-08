@@ -253,7 +253,11 @@ class ImageCache
 
     private function maxBytes(): int
     {
-        return (int) config('image-cache.max_bytes', 10 * 1024 * 1024);
+        $default = 10 * 1024 * 1024;
+        $max = (int) config('image-cache.max_bytes', $default);
+
+        // 0 means unlimited; a negative typo must not silently mean the same.
+        return $max < 0 ? $default : $max;
     }
 
     private function timeout(): int

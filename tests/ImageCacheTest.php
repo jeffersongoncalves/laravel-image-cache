@@ -210,15 +210,33 @@ it('rejects a body above max_bytes without a Content-Length', function () {
 });
 
 it('stores a body under max_bytes, and any size when max_bytes is 0', function () {
-    config()->set('image-cache.max_bytes', 10);
-    Http::fake(['https://1.1.1.1/*' => Http::response('0123456789', 200, ['Content-Type' => 'image/png'])]);
+    // One fake with distinct URLs: Laravel keeps every Http::fake() stub and
+    // the first match wins, so a second fake for the same pattern is ignored.
+    Http::fake([
+        'https://1.1.1.1/small.png' => Http::response('0123456789', 200, ['Content-Type' => 'image/png']),
+        'https://1.1.1.1/big.png' => Http::response(str_repeat('x', 100), 200, ['Content-Type' => 'image/png']),
+    ]);
 
-    expect(makeImageCache()->warm('photo', 'https://1.1.1.1/photo.png'))->toBeTrue();
+    $cache = makeImageCache();
+
+    config()->set('image-cache.max_bytes', 10);
+    expect($cache->warm('small', 'https://1.1.1.1/small.png'))->toBeTrue()
+        ->and($cache->get('small')['body'])->toBe('0123456789');
 
     config()->set('image-cache.max_bytes', 0);
-    Http::fake(['https://1.1.1.1/*' => Http::response(str_repeat('x', 100), 200, ['Content-Type' => 'image/png'])]);
+    expect($cache->warm('big', 'https://1.1.1.1/big.png'))->toBeTrue()
+        ->and($cache->get('big')['body'])->toBe(str_repeat('x', 100));
+});
 
-    expect(makeImageCache()->warm('big', 'https://1.1.1.1/big.png'))->toBeTrue();
+it('falls back to the default limit for a negative max_bytes', function () {
+    config()->set('image-cache.max_bytes', -1);
+    Http::fake([
+        'https://1.1.1.1/*' => Http::response('small', 200, ['Content-Type' => 'image/png', 'Content-Length' => (string) (11 * 1024 * 1024)]),
+    ]);
+
+    expect(makeImageCache()->warm('photo', 'https://1.1.1.1/photo.png'))->toBeFalse();
+
+    Storage::disk('images')->assertMissing('cache/photo');
 });
 
 it('builds a transparent gif placeholder response', function () {
