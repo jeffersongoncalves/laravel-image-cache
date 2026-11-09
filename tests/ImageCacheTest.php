@@ -23,7 +23,7 @@ it('fetches and persists body and type on a successful warm', function () {
     expect($cache->warm('photo', 'https://1.1.1.1/photo.png'))->toBeTrue();
 
     Storage::disk('images')->assertExists('cache/photo');
-    Storage::disk('images')->assertExists('cache/photo.type');
+    Storage::disk('images')->assertExists('cache/blobs/'.hash('sha256', 'binary-image-data'));
 
     expect($cache->get('photo'))->toBe([
         'body' => 'binary-image-data',
@@ -184,6 +184,62 @@ it('retries every time when the failure ttl is 0', function () {
     $cache->warm('photo', 'https://1.1.1.1/photo.png');
 
     Http::assertSentCount(2);
+});
+
+it('stores identical images reached through different urls once', function () {
+    Http::fake(['https://1.1.1.1/*' => Http::response('same-bytes', 200, ['Content-Type' => 'image/png'])]);
+
+    $cache = makeImageCache();
+    $cache->warm('a', 'https://1.1.1.1/1.x/banner.png');
+    $cache->warm('b', 'https://1.1.1.1/2.x/banner.png');
+
+    expect(Storage::disk('images')->files('cache/blobs'))->toBe(['cache/blobs/'.hash('sha256', 'same-bytes')])
+        ->and($cache->get('a'))->toBe(['body' => 'same-bytes', 'type' => 'image/png'])
+        ->and($cache->get('b'))->toBe(['body' => 'same-bytes', 'type' => 'image/png']);
+});
+
+it('still reads the legacy body + .type layout and replaces it on re-warm', function () {
+    $disk = Storage::disk('images');
+    $disk->put('cache/photo', 'legacy-bytes');
+    $disk->put('cache/photo.type', 'image/jpeg');
+
+    $cache = makeImageCache();
+
+    expect($cache->get('photo'))->toBe(['body' => 'legacy-bytes', 'type' => 'image/jpeg']);
+
+    touch($disk->path('cache/photo'), time() - 90000);
+    Http::fake(['https://1.1.1.1/*' => Http::response('new-bytes', 200, ['Content-Type' => 'image/png'])]);
+
+    expect($cache->warm('photo', 'https://1.1.1.1/photo.png'))->toBeTrue()
+        ->and($cache->get('photo'))->toBe(['body' => 'new-bytes', 'type' => 'image/png']);
+
+    $disk->assertMissing('cache/photo.type');
+});
+
+it('prunes only old blobs no key points at', function () {
+    Http::fake(['https://1.1.1.1/*' => Http::sequence()
+        ->push('old-bytes', 200, ['Content-Type' => 'image/png'])
+        ->push('new-bytes', 200, ['Content-Type' => 'image/png']),
+    ]);
+
+    $disk = Storage::disk('images');
+    $cache = makeImageCache();
+    $cache->warm('photo', 'https://1.1.1.1/photo.png');
+    touch($disk->path('cache/photo'), time() - 90000);
+    $cache->warm('photo', 'https://1.1.1.1/photo.png');
+
+    $old = 'cache/blobs/'.hash('sha256', 'old-bytes');
+    $new = 'cache/blobs/'.hash('sha256', 'new-bytes');
+
+    expect($cache->prune())->toBe(0); // orphan still inside the grace period
+
+    touch($disk->path($old), time() - 7200);
+    touch($disk->path($new), time() - 7200);
+
+    expect($cache->prune())->toBe(1);
+    $disk->assertMissing($old);
+    $disk->assertExists($new);
+    expect($cache->get('photo')['body'])->toBe('new-bytes');
 });
 
 it('rejects an image whose Content-Length is above max_bytes', function () {

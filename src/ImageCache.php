@@ -104,9 +104,16 @@ class ImageCache
             return false;
         }
 
-        $disk->put($path, $fetched['body']);
-        $disk->put($path.'.type', $fetched['type']);
-        $disk->delete($path.'.failed');
+        // Content-addressed: the same image reached through different URLs
+        // (e.g. a README on several branches) is stored once.
+        $hash = hash('sha256', $fetched['body']);
+
+        if (! $disk->exists($this->blobPath($hash))) {
+            $disk->put($this->blobPath($hash), $fetched['body']);
+        }
+
+        $disk->put($path, (string) json_encode(['blob' => $hash, 'type' => $fetched['type']]));
+        $disk->delete([$path.'.type', $path.'.failed']);
 
         return true;
     }
@@ -149,14 +156,91 @@ class ImageCache
         $disk = Storage::disk($this->disk);
         $path = $this->path($key);
 
-        if (! $disk->exists($path) || ! $disk->exists($path.'.type')) {
+        if (! $disk->exists($path)) {
+            return null;
+        }
+
+        $entry = (string) $disk->get($path);
+        $pointer = $this->decodePointer($entry);
+
+        if ($pointer !== null) {
+            $blob = $this->blobPath($pointer['blob']);
+
+            return $disk->exists($blob)
+                ? ['body' => (string) $disk->get($blob), 'type' => $pointer['type']]
+                : null;
+        }
+
+        // Legacy layout (body + `.type` sidecar), kept readable until the key is re-warmed.
+        if (! $disk->exists($path.'.type')) {
             return null;
         }
 
         return [
-            'body' => (string) $disk->get($path),
+            'body' => $entry,
             'type' => (string) $disk->get($path.'.type'),
         ];
+    }
+
+    /**
+     * Delete blobs no key points at any more. Returns how many were deleted.
+     *
+     * Blobs younger than an hour are kept, so a warm() that has written its
+     * blob but not yet its pointer is not raced. Scans every file under the
+     * prefix, so schedule it (e.g. daily) rather than calling it per request.
+     */
+    public function prune(): int
+    {
+        $disk = Storage::disk($this->disk);
+        $blobDir = $this->path('blobs');
+        $referenced = [];
+
+        foreach ($disk->allFiles(rtrim($this->pathPrefix, '/')) as $file) {
+            // Size check first: don't download a multi-MB legacy body just to learn it isn't a pointer.
+            if (! str_starts_with($file, $blobDir.'/') && ! preg_match('/\.(type|failed)$/', $file) && $disk->size($file) <= 512) {
+                $pointer = $this->decodePointer((string) $disk->get($file));
+
+                if ($pointer !== null) {
+                    $referenced[$pointer['blob']] = true;
+                }
+            }
+        }
+
+        $cutoff = now()->subHour()->timestamp;
+        $deleted = 0;
+
+        foreach ($disk->files($blobDir) as $blob) {
+            if (! isset($referenced[basename($blob)]) && $disk->lastModified($blob) < $cutoff) {
+                $disk->delete($blob);
+                $deleted++;
+            }
+        }
+
+        return $deleted;
+    }
+
+    private function blobPath(string $hash): string
+    {
+        return $this->path('blobs/'.$hash);
+    }
+
+    /**
+     * @return array{blob: string, type: string}|null
+     */
+    private function decodePointer(string $entry): ?array
+    {
+        // Pointers are tiny JSON; skip decoding a (legacy) image body.
+        if (strlen($entry) > 512 || ! str_starts_with($entry, '{')) {
+            return null;
+        }
+
+        $data = json_decode($entry, true);
+
+        return is_array($data)
+            && is_string($data['blob'] ?? null) && preg_match('/^[0-9a-f]{64}$/', $data['blob'])
+            && is_string($data['type'] ?? null)
+            ? ['blob' => $data['blob'], 'type' => $data['type']]
+            : null;
     }
 
     /**

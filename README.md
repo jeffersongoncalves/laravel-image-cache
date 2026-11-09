@@ -105,6 +105,18 @@ For an `<img>` you would rather not break, answer with a 1x1 transparent GIF ins
 return $cache->response($key) ?? ImageCache::placeholder();
 ```
 
+### Storage layout and pruning
+
+Image bodies are stored once per content, under `<prefix>/blobs/<sha256>`; each key is a tiny JSON pointer (`{"blob": "<sha256>", "type": "image/png"}`) at `<prefix>/<key>`. The same image reached through different URLs (say, one README on several branches) therefore takes the disk space of a single copy. Caches written by older versions (`<key>` body + `<key>.type`) are still read, and move to the new layout the next time the key is warmed.
+
+When a key is re-warmed with different bytes, its old blob is left behind. `prune()` deletes every blob no key points at (blobs younger than an hour are kept, so an in-flight `warm()` is never raced) and returns how many it removed. It scans the whole prefix, so schedule it instead of calling it per request:
+
+```php
+Schedule::call(fn () => (new ImageCache('public', 'og-images'))->prune())->daily();
+```
+
+Using a bucket lifecycle rule on a remote disk instead? Never expire `<prefix>/blobs/` by age alone: a blob can be shared by keys that are still fresh.
+
 ## Configuration
 
 | Key | Default | Description |
