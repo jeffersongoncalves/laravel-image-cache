@@ -315,6 +315,49 @@ it('serves a fresh hit with a single disk read', function () {
         ->and($calls->getArrayCopy())->toBe(['get cache/blobs/'.hash('sha256', 'binary-image-data')]);
 });
 
+it('exposes a warmed key\'s blob path from the Laravel cache, else one pointer read', function () {
+    Http::fake(['https://1.1.1.1/*' => Http::response('binary-image-data', 200, ['Content-Type' => 'image/png'])]);
+
+    $cache = makeImageCache();
+    $cache->warm('photo', 'https://1.1.1.1/photo.png');
+    $blob = 'cache/blobs/'.hash('sha256', 'binary-image-data');
+    $calls = spyOnImagesDisk();
+
+    expect($cache->blobPath('photo'))->toBe($blob)
+        ->and($calls->getArrayCopy())->toBe([]);
+
+    Cache::flush();
+
+    expect($cache->blobPath('photo'))->toBe($blob)
+        ->and($cache->blobPath('photo'))->toBe($blob)
+        ->and($calls->getArrayCopy())->toBe(['get cache/photo']);
+});
+
+it('has no blob path for a never-warmed or legacy key', function () {
+    Storage::disk('images')->put('cache/legacy', 'legacy-bytes');
+    Storage::disk('images')->put('cache/legacy.type', 'image/png');
+
+    $cache = makeImageCache();
+
+    expect($cache->blobPath('missing'))->toBeNull()
+        ->and($cache->blobPath('legacy'))->toBeNull()
+        ->and($cache->url('missing'))->toBeNull();
+});
+
+it('builds a public url only when the disk has one configured', function () {
+    Http::fake(['https://1.1.1.1/*' => Http::response('binary-image-data', 200, ['Content-Type' => 'image/png'])]);
+
+    $cache = makeImageCache();
+    $cache->warm('photo', 'https://1.1.1.1/photo.png');
+
+    expect($cache->url('photo'))->toBeNull();
+
+    Storage::fake('images', ['url' => 'https://assets.example.com']);
+    $cache->warm('photo', 'https://1.1.1.1/photo.png');
+
+    expect($cache->url('photo'))->toBe('https://assets.example.com/cache/blobs/'.hash('sha256', 'binary-image-data'));
+});
+
 it('serves the just-warmed bytes only once from memory', function () {
     Http::fake(['https://1.1.1.1/*' => Http::response('binary-image-data', 200, ['Content-Type' => 'image/png'])]);
 

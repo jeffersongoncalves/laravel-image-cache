@@ -142,7 +142,7 @@ class ImageCache
         // exists() first: same bytes, so overwriting is harmless, one round
         // trip cheaper on S3/R2, and it renews the blob's upload time.
         $hash = hash('sha256', $fetched['body']);
-        $disk->put($this->blobPath($hash), $fetched['body']);
+        $disk->put($this->blobFile($hash), $fetched['body']);
 
         $ptrKey = $this->cacheKey($key).':ptr';
         // An existing entry not known to be a pointer may be the legacy
@@ -217,9 +217,6 @@ class ImageCache
      */
     public function get(string $key): ?array
     {
-        // Read straight away and treat null as a miss: an exists() first would
-        // be an extra billed round trip on S3/R2. With the pointer in the
-        // Laravel cache, a hit is a single disk read (the blob).
         // Just warmed: serve the bytes we already hold instead of reading the
         // blob straight back. Used once, so a long-lived instance (Octane)
         // never keeps serving them after another server re-warmed the key.
@@ -230,33 +227,23 @@ class ImageCache
             return ['body' => $body, 'type' => $type];
         }
 
+        // Read straight away and treat null as a miss: an exists() first would
+        // be an extra billed round trip on S3/R2. With the pointer in the
+        // Laravel cache, a hit is a single disk read (the blob).
         $path = $this->path($key);
-        $ptrKey = $this->cacheKey($key).':ptr';
-        /** @var array{blob: string, type: string}|null $pointer */
-        $pointer = $this->cache()->get($ptrKey);
-        $entry = null;
+        $pointer = $this->pointer($key, $entry);
 
-        if ($pointer === null) {
-            $entry = $this->read($path);
-
-            if ($entry === null) {
-                return null;
-            }
-
-            $pointer = $this->decodePointer($entry);
-
-            if ($pointer !== null) {
-                $this->cache()->put($ptrKey, $pointer, $this->ttlSeconds);
-            }
+        if ($pointer === null && $entry === null) {
+            return null;
         }
 
         if ($pointer !== null) {
-            $body = $this->read($this->blobPath($pointer['blob']));
+            $body = $this->read($this->blobFile($pointer['blob']));
 
             if ($body === null) {
                 // Blob gone (pruned, wiped, lifecycle rule): drop the broken
                 // pointer so the next warm() re-fetches instead of no-oping.
-                $this->cache()->forget($ptrKey);
+                $this->cache()->forget($this->cacheKey($key).':ptr');
                 $this->cache()->forget($this->cacheKey($key).':until');
                 Storage::disk($this->disk)->delete($path);
 
@@ -270,6 +257,60 @@ class ImageCache
         $type = $this->read($path.'.type');
 
         return $type === null ? null : ['body' => (string) $entry, 'type' => $type];
+    }
+
+    /**
+     * The disk path of a warmed key's blob (`<prefix>/blobs/<sha256>`), for
+     * sending visitors straight to a public bucket/CDN instead of streaming
+     * the bytes through PHP. null when the key isn't warmed or is still in
+     * the legacy layout. No disk call when the pointer is in the Laravel
+     * cache, one small read otherwise; the blob itself is not checked.
+     */
+    public function blobPath(string $key): ?string
+    {
+        $pointer = $this->pointer($key);
+
+        return $pointer === null ? null : $this->blobFile($pointer['blob']);
+    }
+
+    /**
+     * Public URL of a warmed key's blob, or null when the key has no blob or
+     * the disk has no `url` configured.
+     */
+    public function url(string $key): ?string
+    {
+        $disk = Storage::disk($this->disk);
+        $blob = $this->blobPath($key);
+
+        return $blob !== null && ! empty($disk->getConfig()['url']) ? $disk->url($blob) : null;
+    }
+
+    /**
+     * The key's pointer: from the Laravel cache, else one read of the entry
+     * (then cached). $entry receives that raw read, so get() can fall back to
+     * the legacy layout without downloading it twice.
+     *
+     * @return array{blob: string, type: string}|null
+     */
+    private function pointer(string $key, ?string &$entry = null): ?array
+    {
+        $ptrKey = $this->cacheKey($key).':ptr';
+        /** @var array{blob: string, type: string}|null $pointer */
+        $pointer = $this->cache()->get($ptrKey);
+
+        if ($pointer !== null) {
+            return $pointer;
+        }
+
+        $entry = $this->read($this->path($key));
+        $pointer = $entry === null ? null : $this->decodePointer($entry);
+
+        if ($pointer !== null) {
+            // Same 2x TTL as warm(), so a stale re-warm still knows the layout.
+            $this->cache()->put($ptrKey, $pointer, 2 * $this->ttlSeconds);
+        }
+
+        return $pointer;
     }
 
     /**
@@ -309,7 +350,7 @@ class ImageCache
         return $deleted;
     }
 
-    private function blobPath(string $hash): string
+    private function blobFile(string $hash): string
     {
         return $this->path('blobs/'.$hash);
     }
