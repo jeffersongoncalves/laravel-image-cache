@@ -283,6 +283,20 @@ function spyOnImagesDisk(): ArrayObject
 
             return parent::lastModified($path);
         }
+
+        public function put($path, $contents, $options = []): string|bool
+        {
+            $this->calls[] = 'put '.$path;
+
+            return parent::put($path, $contents, $options);
+        }
+
+        public function delete($paths): bool
+        {
+            $this->calls[] = 'delete '.implode(',', (array) $paths);
+
+            return parent::delete($paths);
+        }
     });
 
     return $calls;
@@ -291,10 +305,10 @@ function spyOnImagesDisk(): ArrayObject
 it('serves a fresh hit with a single disk read', function () {
     Http::fake(['https://1.1.1.1/*' => Http::response('binary-image-data', 200, ['Content-Type' => 'image/png'])]);
 
-    $cache = makeImageCache();
-    $cache->warm('photo', 'https://1.1.1.1/photo.png');
+    makeImageCache()->warm('photo', 'https://1.1.1.1/photo.png');
 
     $calls = spyOnImagesDisk();
+    $cache = makeImageCache(); // a later request
 
     expect($cache->warm('photo', 'https://1.1.1.1/photo.png'))->toBeTrue()
         ->and($cache->response('photo')->getContent())->toBe('binary-image-data')
@@ -344,12 +358,56 @@ it('builds a public url only when the disk has one configured', function () {
     expect($cache->url('photo'))->toBe('https://assets.example.com/cache/blobs/'.hash('sha256', 'binary-image-data'));
 });
 
-it('drops a pointer whose blob is gone so the next warm re-fetches', function () {
+it('serves the just-warmed bytes only once from memory', function () {
     Http::fake(['https://1.1.1.1/*' => Http::response('binary-image-data', 200, ['Content-Type' => 'image/png'])]);
 
     $cache = makeImageCache();
     $cache->warm('photo', 'https://1.1.1.1/photo.png');
+    $calls = spyOnImagesDisk();
+
+    $cache->get('photo');
+    expect($calls->getArrayCopy())->toBe([]);
+
+    $cache->get('photo');
+    expect($calls->getArrayCopy())->toBe(['get cache/blobs/'.hash('sha256', 'binary-image-data')]);
+});
+
+it('serves a miss with two HEADs and two PUTs, and no read back', function () {
+    Http::fake(['https://1.1.1.1/*' => Http::response('binary-image-data', 200, ['Content-Type' => 'image/png'])]);
+
+    $calls = spyOnImagesDisk();
+    $cache = makeImageCache();
+
+    expect($cache->warm('photo', 'https://1.1.1.1/photo.png'))->toBeTrue()
+        ->and($cache->response('photo')->getContent())->toBe('binary-image-data')
+        ->and($calls->getArrayCopy())->toBe([
+            'lastModified cache/photo',
+            'lastModified cache/photo.failed',
+            'put cache/blobs/'.hash('sha256', 'binary-image-data'),
+            'put cache/photo',
+        ]);
+});
+
+it('still deletes an old .failed marker on a successful miss', function () {
+    Storage::disk('images')->put('cache/photo.failed', '0');
+    touch(Storage::disk('images')->path('cache/photo.failed'), time() - 7200);
+    Http::fake(['https://1.1.1.1/*' => Http::response('binary-image-data', 200, ['Content-Type' => 'image/png'])]);
+
+    $calls = spyOnImagesDisk();
+
+    expect(makeImageCache()->warm('photo', 'https://1.1.1.1/photo.png'))->toBeTrue()
+        ->and($calls->getArrayCopy())->toContain('delete cache/photo.failed');
+
+    Storage::disk('images')->assertMissing('cache/photo.failed');
+});
+
+it('drops a pointer whose blob is gone so the next warm re-fetches', function () {
+    Http::fake(['https://1.1.1.1/*' => Http::response('binary-image-data', 200, ['Content-Type' => 'image/png'])]);
+
+    makeImageCache()->warm('photo', 'https://1.1.1.1/photo.png');
     Storage::disk('images')->delete('cache/blobs/'.hash('sha256', 'binary-image-data'));
+
+    $cache = makeImageCache(); // a later request
 
     expect($cache->get('photo'))->toBeNull()
         ->and($cache->isFresh('photo'))->toBeFalse()

@@ -149,7 +149,7 @@ Both return `null` for a key that was never warmed or is still in the legacy lay
 
 ### Remote disks (S3, R2)
 
-Every disk call on a remote disk is a billed round trip, so a fresh hit (`warm()` + `response()`) costs **one** read — the image itself. The key's "fresh until" time and pointer are remembered in the Laravel cache (`cache_store`; use a shared store such as Redis when you run several servers), reads never do an `exists()` first, and the `.failed` marker is only checked after a miss. The flip side: freshness is decided by that cache, so a file you age or delete by hand on the disk is not noticed until the TTL runs out (a deleted blob is, on the next read).
+Every disk call on a remote disk is a billed round trip, so a fresh hit (`warm()` + `response()`) costs **one** read — the image itself. The key's "fresh until" time and pointer are remembered in the Laravel cache (`cache_store`; use a shared store such as Redis when you run several servers), reads never do an `exists()` first, and the `.failed` marker is only checked after a miss. A miss costs four calls: two HEADs (the key, the `.failed` marker) and two PUTs (the blob, the pointer). Stale files are only deleted when they may exist, and the `get()`/`response()` right after a successful `warm()` on the same instance serves the bytes just downloaded instead of reading them back. The flip side: freshness is decided by that cache, so a file you age or delete by hand on the disk is not noticed until the TTL runs out (a deleted blob is, on the next read).
 
 ## Testing
 
