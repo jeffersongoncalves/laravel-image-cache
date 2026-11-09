@@ -2,6 +2,38 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.3.0 - 2026-11-09
+
+### What's new
+
+#### Fewer remote-disk calls on a cache miss: 8 → 4 (#14, #16)
+
+A miss (`warm()` + `response()` in one request) now does HEAD + HEAD + PUT + PUT. On Cloudflare R2 from Brazil (400–850 ms per call) that is ~2.2 s instead of ~4.2 s.
+
+- The blob is always PUT, with no `exists()` first. The bytes are the same, so overwriting is harmless, and it renews the blob's upload time.
+- `.failed` is deleted only when a marker was seen, and `.type` only when the key may be in the legacy layout.
+- The `get()`/`response()` right after a successful `warm()` on the same instance serves the bytes just downloaded, without reading the blob back. The copy is used once, so a long-lived instance (Octane) never grows or keeps serving stale bytes.
+
+#### Serve straight from a public bucket / CDN (#15, #17)
+
+- `blobPath(string $key): ?string` returns the blob's disk path without downloading it: no disk call when the pointer is in the Laravel cache, one small read otherwise.
+- `url(string $key): ?string` returns the disk's public URL for that blob when the disk has a `url` configured.
+- Both return `null` for a key that was never warmed or is still in the legacy layout. Fall back to `response()` / `placeholder()`.
+
+```php
+return ($url = $cache->url($slug))
+    ? redirect()->away($url)
+    : ($cache->response($slug) ?? ImageCache::placeholder());
+
+```
+### Upgrade notes
+
+- No code changes needed.
+- With `failure_ttl = 0` no `.failed` marker is written any more, since it would never be read.
+- **Direct links:** a blob deleted from under its pointer is a broken image, not a placeholder. Prefer `prune()`. If you use a bucket lifecycle rule, it now counts from the latest re-warm, so keep the CDN's redirect cache time well under that window.
+
+**Full Changelog**: https://github.com/jeffersongoncalves/laravel-image-cache/compare/1.2.0...1.3.0
+
 ## 1.2.0 - 2026-11-09
 
 ### What's new
