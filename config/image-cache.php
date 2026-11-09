@@ -38,6 +38,18 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Maximum Bytes
+    |--------------------------------------------------------------------------
+    |
+    | Largest image warm() will store. A bigger Content-Length, or a body that
+    | grows past it mid-transfer, aborts the fetch and counts as a failure.
+    | Set to 0 for no limit.
+    |
+    */
+    'max_bytes' => (int) env('IMAGE_CACHE_MAX_BYTES', 10 * 1024 * 1024),
+
+    /*
+    |--------------------------------------------------------------------------
     | Cache Store
     |--------------------------------------------------------------------------
     |
