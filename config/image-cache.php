@@ -47,4 +47,17 @@ return [
     |
     */
     'max_bytes' => (int) env('IMAGE_CACHE_MAX_BYTES', 10 * 1024 * 1024),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Cache Store
+    |--------------------------------------------------------------------------
+    |
+    | Laravel cache store that remembers each key's "fresh until" time and
+    | pointer, so a hit on a remote disk (S3/R2) costs a single read instead
+    | of several billed round trips. null = the app's default store; "array"
+    | effectively turns it off.
+    |
+    */
+    'cache_store' => env('IMAGE_CACHE_STORE'),
 ];
