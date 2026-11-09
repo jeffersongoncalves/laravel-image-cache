@@ -118,6 +118,25 @@ Schedule::call(fn () => (new ImageCache('public', 'og-images'))->prune())->daily
 
 Using a bucket lifecycle rule on a remote disk instead? Never expire `<prefix>/blobs/` by age alone: a blob can be shared by keys that are still fresh.
 
+### Serving from a public bucket / CDN
+
+When the disk has a public domain (say an R2 bucket on `assets.example.com` behind a CDN), send visitors straight to the blob instead of streaming every byte through PHP. `blobPath()` returns the blob's disk path without downloading it (no disk call when the pointer is in the Laravel cache, one small read otherwise), and `url()` turns it into the disk's public URL when the disk has a `url` configured:
+
+```php
+public function show(string $slug)
+{
+    $cache->warm($slug, $sourceUrl);
+
+    return ($url = $cache->url($slug))
+        ? redirect()->away($url)
+        : ($cache->response($slug) ?? ImageCache::placeholder());
+}
+```
+
+Both return `null` for a key that was never warmed or is still in the legacy layout, so the fallback above keeps working.
+
+> **Lifecycle caveat.** With direct links, a blob deleted from under its pointer is a broken image, not a placeholder: a redirect cached by the CDN keeps pointing at it until the pointer is checked again. Prefer `prune()`, which only deletes blobs no key points at. If you use a bucket lifecycle rule ("expire after 30 days"), it must count from the blob's *latest* upload, which holds only when every re-warm re-uploads the blob, and keep the redirect's cache time well under that window.
+
 ## Configuration
 
 | Key | Default | Description |
