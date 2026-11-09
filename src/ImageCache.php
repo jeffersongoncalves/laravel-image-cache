@@ -35,6 +35,9 @@ use Throwable;
  */
 class ImageCache
 {
+    /** @var array{key: string, body: string, type: string}|null */
+    private ?array $lastWarmed = null;
+
     public function __construct(
         private readonly string $disk,
         private readonly string $pathPrefix,
@@ -54,22 +57,32 @@ class ImageCache
      */
     public function isFresh(string $key): bool
     {
+        return $this->staleSince($key) === null;
+    }
+
+    /**
+     * null when fresh; otherwise the entry's last-modified time (0 = no
+     * entry), which warm() reuses instead of asking the disk again.
+     */
+    private function staleSince(string $key): ?int
+    {
         $cacheKey = $this->cacheKey($key).':until';
 
         if ((int) $this->cache()->get($cacheKey) > now()->timestamp) {
-            return true;
+            return null;
         }
 
-        $until = $this->lastModified($this->path($key)) + $this->ttlSeconds;
+        $modified = $this->lastModified($this->path($key));
+        $until = $modified + $this->ttlSeconds;
 
         if ($until < now()->timestamp) {
-            return false;
+            return $modified;
         }
 
         // Remember it so the next request skips the HEAD on a remote disk.
         $this->cache()->put($cacheKey, $until, $until - now()->timestamp);
 
-        return true;
+        return null;
     }
 
     /**
@@ -88,11 +101,15 @@ class ImageCache
      */
     public function warm(string $key, string $url, ?array $resolve = null): bool
     {
-        if ($this->isFresh($key)) {
+        $entryModified = $this->staleSince($key);
+
+        if ($entryModified === null) {
             return true;
         }
 
-        if ($this->recentlyFailed($key)) {
+        $failedAt = $this->failedAt($key);
+
+        if ($this->isRecentFailure($failedAt)) {
             return false;
         }
 
@@ -113,25 +130,41 @@ class ImageCache
         if ($fetched === null) {
             // Negative cache: a missing upstream image (e.g. a README pointing
             // at a deleted file) would otherwise be re-fetched on every request.
-            $disk->put($path.'.failed', (string) now()->timestamp);
+            if ($this->failureTtl() > 0) {
+                $disk->put($path.'.failed', (string) now()->timestamp);
+            }
 
             return false;
         }
 
         // Content-addressed: the same image reached through different URLs
-        // (e.g. a README on several branches) is stored once.
+        // (e.g. a README on several branches) is stored once. Always PUT, no
+        // exists() first: same bytes, so overwriting is harmless, one round
+        // trip cheaper on S3/R2, and it renews the blob's upload time.
         $hash = hash('sha256', $fetched['body']);
+        $disk->put($this->blobPath($hash), $fetched['body']);
 
-        if (! $disk->exists($this->blobPath($hash))) {
-            $disk->put($this->blobPath($hash), $fetched['body']);
-        }
+        $ptrKey = $this->cacheKey($key).':ptr';
+        // An existing entry not known to be a pointer may be the legacy
+        // layout, whose `.type` sidecar must go. No entry at all: nothing to do.
+        $mayBeLegacy = $entryModified > 0 && $this->cache()->get($ptrKey) === null;
 
         $pointer = ['blob' => $hash, 'type' => $fetched['type']];
         $disk->put($path, (string) json_encode($pointer));
-        $disk->delete([$path.'.type', $path.'.failed']);
+
+        // Each delete is its own call on Flysystem, so only delete what may exist.
+        $stale = array_merge($mayBeLegacy ? [$path.'.type'] : [], $failedAt > 0 ? [$path.'.failed'] : []);
+
+        if ($stale !== []) {
+            $disk->delete($stale);
+        }
 
         $this->cache()->put($this->cacheKey($key).':until', now()->timestamp + $this->ttlSeconds, $this->ttlSeconds);
-        $this->cache()->put($this->cacheKey($key).':ptr', $pointer, $this->ttlSeconds);
+        // Outlives freshness so the next stale re-warm still knows this key is a pointer.
+        $this->cache()->put($ptrKey, $pointer, 2 * $this->ttlSeconds);
+
+        // ponytail: one slot, not a map, so a long-lived instance can't grow.
+        $this->lastWarmed = ['key' => $key, 'body' => $fetched['body'], 'type' => $fetched['type']];
 
         return true;
     }
@@ -142,10 +175,26 @@ class ImageCache
      */
     public function recentlyFailed(string $key): bool
     {
-        $ttl = (int) config('image-cache.failure_ttl', 3600);
+        return $this->isRecentFailure($this->failedAt($key));
+    }
 
-        return $ttl > 0
-            && $this->lastModified($this->path($key).'.failed') >= now()->subSeconds($ttl)->timestamp;
+    /**
+     * The `.failed` marker's time, 0 when there is none (or the negative
+     * cache is disabled, in which case no marker is written).
+     */
+    private function failedAt(string $key): int
+    {
+        return $this->failureTtl() > 0 ? $this->lastModified($this->path($key).'.failed') : 0;
+    }
+
+    private function isRecentFailure(int $failedAt): bool
+    {
+        return $failedAt > 0 && $failedAt >= now()->subSeconds($this->failureTtl())->timestamp;
+    }
+
+    private function failureTtl(): int
+    {
+        return (int) config('image-cache.failure_ttl', 3600);
     }
 
     /**
@@ -171,6 +220,16 @@ class ImageCache
         // Read straight away and treat null as a miss: an exists() first would
         // be an extra billed round trip on S3/R2. With the pointer in the
         // Laravel cache, a hit is a single disk read (the blob).
+        // Just warmed: serve the bytes we already hold instead of reading the
+        // blob straight back. Used once, so a long-lived instance (Octane)
+        // never keeps serving them after another server re-warmed the key.
+        if ($this->lastWarmed !== null && $this->lastWarmed['key'] === $key) {
+            ['body' => $body, 'type' => $type] = $this->lastWarmed;
+            $this->lastWarmed = null;
+
+            return ['body' => $body, 'type' => $type];
+        }
+
         $path = $this->path($key);
         $ptrKey = $this->cacheKey($key).':ptr';
         /** @var array{blob: string, type: string}|null $pointer */
