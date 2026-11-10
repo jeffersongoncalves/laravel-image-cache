@@ -107,9 +107,9 @@ class ImageCache
             return true;
         }
 
-        $failedAt = $this->failedAt($key);
+        $failedUntil = $this->failedUntil($key);
 
-        if ($this->isRecentFailure($failedAt)) {
+        if ($failedUntil > now()->timestamp) {
             return false;
         }
 
@@ -127,11 +127,12 @@ class ImageCache
         $disk = Storage::disk($this->disk);
         $path = $this->path($key);
 
-        if ($fetched === null) {
+        if (is_int($fetched)) {
             // Negative cache: a missing upstream image (e.g. a README pointing
             // at a deleted file) would otherwise be re-fetched on every request.
-            if ($this->failureTtl() > 0) {
-                $disk->put($path.'.failed', (string) now()->timestamp);
+            // The marker holds its expiry, so each failure class keeps its own TTL.
+            if ($fetched > 0) {
+                $disk->put($path.'.failed', 'until:'.(now()->timestamp + $fetched));
             }
 
             return false;
@@ -153,7 +154,7 @@ class ImageCache
         $disk->put($path, (string) json_encode($pointer));
 
         // Each delete is its own call on Flysystem, so only delete what may exist.
-        $stale = array_merge($mayBeLegacy ? [$path.'.type'] : [], $failedAt > 0 ? [$path.'.failed'] : []);
+        $stale = array_merge($mayBeLegacy ? [$path.'.type'] : [], $failedUntil > 0 ? [$path.'.failed'] : []);
 
         if ($stale !== []) {
             $disk->delete($stale);
@@ -170,31 +171,69 @@ class ImageCache
     }
 
     /**
-     * Whether the last fetch for this key failed less than
-     * `image-cache.failure_ttl` seconds ago (0 disables the negative cache).
+     * Whether this key's last fetch failed and its negative-cache window
+     * (`failure_ttl`, `permanent_failure_ttl` or the upstream's Retry-After)
+     * has not run out yet.
      */
     public function recentlyFailed(string $key): bool
     {
-        return $this->isRecentFailure($this->failedAt($key));
+        return $this->failedUntil($key) > now()->timestamp;
     }
 
     /**
-     * The `.failed` marker's time, 0 when there is none (or the negative
-     * cache is disabled, in which case no marker is written).
+     * When the `.failed` marker expires, 0 when there is none (or both TTLs
+     * are 0, in which case no marker is written). One read of the marker.
      */
-    private function failedAt(string $key): int
+    private function failedUntil(string $key): int
     {
-        return $this->failureTtl() > 0 ? $this->lastModified($this->path($key).'.failed') : 0;
+        if ($this->failureTtl() <= 0 && $this->permanentFailureTtl() <= 0) {
+            return 0;
+        }
+
+        $marker = $this->read($this->path($key).'.failed');
+
+        if ($marker === null) {
+            return 0;
+        }
+
+        // Markers written before failures were classified hold the failure time.
+        return str_starts_with($marker, 'until:')
+            ? (int) substr($marker, 6)
+            : (int) $marker + $this->failureTtl();
     }
 
-    private function isRecentFailure(int $failedAt): bool
-    {
-        return $failedAt > 0 && $failedAt >= now()->subSeconds($this->failureTtl())->timestamp;
-    }
-
+    /**
+     * Transient failures (timeout, 5xx, 403, 429...): retry after failure_ttl.
+     */
     private function failureTtl(): int
     {
         return (int) config('image-cache.failure_ttl', 3600);
+    }
+
+    /**
+     * Deterministic failures (404, 410, non-image, oversized): a retry won't help.
+     */
+    private function permanentFailureTtl(): int
+    {
+        return (int) config('image-cache.permanent_failure_ttl', 7 * 86400);
+    }
+
+    /**
+     * failure_ttl, raised to the upstream's Retry-After (seconds or an HTTP
+     * date) so a rate-limited host is not hammered the moment our TTL ends.
+     * Capped at permanent_failure_ttl, so a hostile header can't park a key forever.
+     */
+    private function retryAfterTtl(string $header): int
+    {
+        $ttl = $this->failureTtl();
+
+        if ($ttl <= 0 || $header === '') {
+            return max(0, $ttl);
+        }
+
+        $retryAfter = ctype_digit($header) ? (int) $header : (int) strtotime($header) - now()->timestamp;
+
+        return max($ttl, min($retryAfter, max($ttl, $this->permanentFailureTtl())));
     }
 
     /**
@@ -428,20 +467,25 @@ class ImageCache
     }
 
     /**
+     * The image, or on failure how many seconds to negative-cache it for.
+     *
      * @param  list<string>  $resolve
-     * @return array{body: string, type: string}|null
+     * @return array{body: string, type: string}|int
      */
-    private function fetch(string $url, array $resolve): ?array
+    private function fetch(string $url, array $resolve): array|int
     {
         $maxBytes = $this->maxBytes();
+        $oversized = false;
 
         try {
             $response = Http::timeout($this->timeout())->withOptions([
                 'curl' => [CURLOPT_RESOLVE => $resolve],
                 // Abort mid-transfer: $total is the Content-Length when sent,
                 // $downloaded catches a missing or lying header.
-                'progress' => function (int $total, int $downloaded) use ($maxBytes): void {
+                'progress' => function (int $total, int $downloaded) use ($maxBytes, &$oversized): void {
                     if ($maxBytes > 0 && max($total, $downloaded) > $maxBytes) {
+                        $oversized = true;
+
                         throw new RuntimeException('ImageCache fetch exceeded max_bytes ('.$maxBytes.')');
                     }
                 },
@@ -464,13 +508,18 @@ class ImageCache
         } catch (Throwable $e) {
             Log::warning('ImageCache fetch threw', ['url' => $url, 'error' => $e->getMessage()]);
 
-            return null;
+            return $oversized ? $this->permanentFailureTtl() : $this->failureTtl();
         }
 
         if (! $response->successful()) {
-            Log::warning('ImageCache fetch failed', ['url' => $url, 'status' => $response->status()]);
+            $status = $response->status();
+            Log::warning('ImageCache fetch failed', ['url' => $url, 'status' => $status]);
 
-            return null;
+            return match ($status) {
+                404, 410 => $this->permanentFailureTtl(),
+                429, 503 => $this->retryAfterTtl(trim((string) $response->header('Retry-After'))),
+                default => $this->failureTtl(),
+            };
         }
 
         // This is typically proxied verbatim to visitors. An untrusted
@@ -481,7 +530,7 @@ class ImageCache
         if (! str_starts_with($type, 'image/')) {
             Log::warning('ImageCache rejected non-image upstream', ['url' => $url, 'type' => $type]);
 
-            return null;
+            return $this->permanentFailureTtl();
         }
 
         // ponytail: the progress callback above only runs under the real curl
@@ -491,7 +540,7 @@ class ImageCache
         if ($maxBytes > 0 && max((int) $response->header('Content-Length'), strlen($body)) > $maxBytes) {
             Log::warning('ImageCache rejected oversized upstream', ['url' => $url, 'max_bytes' => $maxBytes]);
 
-            return null;
+            return $this->permanentFailureTtl();
         }
 
         return [

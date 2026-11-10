@@ -45,6 +45,7 @@ return [
     'timeout' => (int) env('IMAGE_CACHE_TIMEOUT', 8),
     'max_redirects' => (int) env('IMAGE_CACHE_MAX_REDIRECTS', 3),
     'failure_ttl' => (int) env('IMAGE_CACHE_FAILURE_TTL', 3600),
+    'permanent_failure_ttl' => (int) env('IMAGE_CACHE_PERMANENT_FAILURE_TTL', 7 * 86400),
     'max_bytes' => (int) env('IMAGE_CACHE_MAX_BYTES', 10 * 1024 * 1024),
     'cache_store' => env('IMAGE_CACHE_STORE'),
 ];
@@ -62,7 +63,7 @@ $cache = new ImageCache(disk: 'public', pathPrefix: 'og-images', ttlSeconds: 864
 
 ### Warming the cache
 
-`warm()` fetches and persists the image if the disk copy is missing or older than the TTL. It no-ops (returns `true`) when already fresh, and **never throws** — any failure (network error, non-2xx, non-image content type, a redirect into a non-public host) is logged as a warning and `false` is returned, leaving any existing stale copy untouched. Serving yesterday's copy beats erroring. A failed fetch is also remembered for `failure_ttl` seconds (`recentlyFailed($key)`), so an upstream that is gone is not hit again on every request:
+`warm()` fetches and persists the image if the disk copy is missing or older than the TTL. It no-ops (returns `true`) when already fresh, and **never throws** — any failure (network error, non-2xx, non-image content type, a redirect into a non-public host) is logged as a warning and `false` is returned, leaving any existing stale copy untouched. Serving yesterday's copy beats erroring. A failed fetch is also remembered (`recentlyFailed($key)`), so an upstream that is gone is not hit again on every request: for `permanent_failure_ttl` seconds when a retry won't help (404, 410, non-image, oversized), otherwise for `failure_ttl` seconds, or the upstream's `Retry-After` on a 429/503 when that is longer:
 
 ```php
 $cache->warm(key: 'project-42', url: $project->social_image);
@@ -143,13 +144,14 @@ Both return `null` for a key that was never warmed or is still in the legacy lay
 |-----|---------|-------------|
 | `timeout` | `8` | Maximum seconds a `warm()` fetch may run. |
 | `max_redirects` | `3` | How many redirect hops to follow — each one is re-validated against `SsrfGuard`. |
-| `failure_ttl` | `3600` | Seconds `warm()` skips the upstream after a failed fetch (`0` retries every time). |
+| `failure_ttl` | `3600` | Seconds `warm()` skips the upstream after a transient failure: timeout, 5xx, 403, 429 (`0` retries every time). A longer `Retry-After` on a 429/503 wins, capped at `permanent_failure_ttl`. |
+| `permanent_failure_ttl` | `604800` | Seconds `warm()` skips the upstream after a 404, 410, non-image or oversized response (`0` retries every time). |
 | `max_bytes` | `10485760` | Largest image (bytes) `warm()` stores; bigger ones abort mid-download and count as a failed fetch (`0` = unlimited). |
 | `cache_store` | `null` | Laravel cache store remembering each key's "fresh until" time and pointer (`null` = default store, `array` = off). |
 
 ### Remote disks (S3, R2)
 
-Every disk call on a remote disk is a billed round trip, so a fresh hit (`warm()` + `response()`) costs **one** read — the image itself. The key's "fresh until" time and pointer are remembered in the Laravel cache (`cache_store`; use a shared store such as Redis when you run several servers), reads never do an `exists()` first, and the `.failed` marker is only checked after a miss. A miss costs four calls: two HEADs (the key, the `.failed` marker) and two PUTs (the blob, the pointer). Stale files are only deleted when they may exist, and the `get()`/`response()` right after a successful `warm()` on the same instance serves the bytes just downloaded instead of reading them back. The flip side: freshness is decided by that cache, so a file you age or delete by hand on the disk is not noticed until the TTL runs out (a deleted blob is, on the next read).
+Every disk call on a remote disk is a billed round trip, so a fresh hit (`warm()` + `response()`) costs **one** read — the image itself. The key's "fresh until" time and pointer are remembered in the Laravel cache (`cache_store`; use a shared store such as Redis when you run several servers), reads never do an `exists()` first, and the `.failed` marker is only checked after a miss. A miss costs four calls: a HEAD (the key), a read of the `.failed` marker and two PUTs (the blob, the pointer). Stale files are only deleted when they may exist, and the `get()`/`response()` right after a successful `warm()` on the same instance serves the bytes just downloaded instead of reading them back. The flip side: freshness is decided by that cache, so a file you age or delete by hand on the disk is not noticed until the TTL runs out (a deleted blob is, on the next read).
 
 ## Testing
 
