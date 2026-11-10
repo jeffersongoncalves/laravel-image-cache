@@ -227,6 +227,31 @@ it('honours a longer Retry-After on a 429, in seconds or as an HTTP date', funct
     'http date' => [fn () => now()->addSeconds(7200)->toRfc7231String()],
 ]);
 
+it('ignores Retry-After when the failure ttl is 0', function () {
+    config()->set('image-cache.failure_ttl', 0);
+    Http::fake(['https://1.1.1.1/*' => Http::response('', 429, ['Retry-After' => '7200'])]);
+
+    $cache = makeImageCache();
+    $cache->warm('photo', 'https://1.1.1.1/photo.png');
+    $cache->warm('photo', 'https://1.1.1.1/photo.png');
+
+    Http::assertSentCount(2);
+    Storage::disk('images')->assertMissing('cache/photo.failed');
+});
+
+it('falls back to the failure ttl for an unparsable Retry-After', function () {
+    Http::fake(['https://1.1.1.1/*' => Http::response('', 429, ['Retry-After' => 'soon'])]);
+
+    $cache = makeImageCache();
+    $cache->warm('photo', 'https://1.1.1.1/photo.png');
+
+    $this->travel(3599)->seconds();
+    expect($cache->recentlyFailed('photo'))->toBeTrue();
+
+    $this->travel(2)->seconds();
+    expect($cache->recentlyFailed('photo'))->toBeFalse();
+});
+
 it('caps a hostile Retry-After at the permanent failure ttl', function () {
     Http::fake(['https://1.1.1.1/*' => Http::response('', 429, ['Retry-After' => '999999999'])]);
 

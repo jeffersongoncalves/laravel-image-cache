@@ -144,7 +144,7 @@ Both return `null` for a key that was never warmed or is still in the legacy lay
 |-----|---------|-------------|
 | `timeout` | `8` | Maximum seconds a `warm()` fetch may run. |
 | `max_redirects` | `3` | How many redirect hops to follow — each one is re-validated against `SsrfGuard`. |
-| `failure_ttl` | `3600` | Seconds `warm()` skips the upstream after a transient failure: timeout, 5xx, 403, 429 (`0` retries every time). A longer `Retry-After` on a 429/503 wins, capped at `permanent_failure_ttl`. |
+| `failure_ttl` | `3600` | Seconds `warm()` skips the upstream after a transient failure: timeout, 5xx, 403, 429. A longer `Retry-After` on a 429/503 wins, capped at `permanent_failure_ttl`; one that can't be parsed falls back to `failure_ttl`. `0` retries every time and ignores `Retry-After`. |
 | `permanent_failure_ttl` | `604800` | Seconds `warm()` skips the upstream after a 404, 410, non-image or oversized response (`0` retries every time). |
 | `max_bytes` | `10485760` | Largest image (bytes) `warm()` stores; bigger ones abort mid-download and count as a failed fetch (`0` = unlimited). |
 | `cache_store` | `null` | Laravel cache store remembering each key's "fresh until" time and pointer (`null` = default store, `array` = off). |

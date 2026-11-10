@@ -222,6 +222,8 @@ class ImageCache
      * failure_ttl, raised to the upstream's Retry-After (seconds or an HTTP
      * date) so a rate-limited host is not hammered the moment our TTL ends.
      * Capped at permanent_failure_ttl, so a hostile header can't park a key forever.
+     * failure_ttl = 0 opts transient failures out of the negative cache, so
+     * Retry-After is ignored too. An unparsable header falls back to failure_ttl.
      */
     private function retryAfterTtl(string $header): int
     {
