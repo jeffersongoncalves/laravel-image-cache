@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.4.0 - 2026-11-10
+
+### Classify fetch failures (#18, #19)
+
+The negative cache now picks its TTL from the kind of failure:
+
+- **404, 410, non-image, oversized**: skipped for the new `permanent_failure_ttl` (`IMAGE_CACHE_PERMANENT_FAILURE_TTL`, default 7 days). Retrying won't help.
+- **429, 503**: a `Retry-After` longer than `failure_ttl` is honoured, in seconds or as an HTTP date, capped at `permanent_failure_ttl`. A header that can't be parsed falls back to `failure_ttl`.
+- **Timeouts, other 5xx, 403, anything else**: `failure_ttl`, as before. `failure_ttl = 0` also ignores `Retry-After`.
+
+The `.failed` marker now stores its expiry. Markers written by older versions still work with `failure_ttl`. On a miss the marker is read (GET) instead of HEADed, so a miss is still 4 disk calls.
+
+Upgrading: if you published the config, add `permanent_failure_ttl` (the 7-day default applies without it).
+
 ## 1.3.0 - 2026-11-09
 
 ### What's new
@@ -24,6 +38,7 @@ A miss (`warm()` + `response()` in one request) now does HEAD + HEAD + PUT + PUT
 return ($url = $cache->url($slug))
     ? redirect()->away($url)
     : ($cache->response($slug) ?? ImageCache::placeholder());
+
 
 ```
 ### Upgrade notes
