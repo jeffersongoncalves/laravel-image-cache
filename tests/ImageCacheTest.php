@@ -1,6 +1,7 @@
 <?php
 
 use Illuminate\Filesystem\FilesystemAdapter;
+use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Storage;
@@ -156,10 +157,10 @@ it('returns null response for a never-warmed key', function () {
     expect(makeImageCache()->response('missing'))->toBeNull();
 });
 
-it('skips the upstream after a failed fetch until the failure ttl passes', function () {
+it('skips the upstream after a transient failure until the failure ttl passes', function () {
     Http::fake([
         'https://1.1.1.1/*' => Http::sequence()
-            ->push('', 404)
+            ->push('', 500)
             ->push('binary-image-data', 200, ['Content-Type' => 'image/png']),
     ]);
 
@@ -171,16 +172,110 @@ it('skips the upstream after a failed fetch until the failure ttl passes', funct
 
     Http::assertSentCount(1);
 
-    touch(Storage::disk('images')->path('cache/photo.failed'), time() - 3601);
+    $this->travel(3601)->seconds();
 
     expect($cache->warm('photo', 'https://1.1.1.1/photo.png'))->toBeTrue();
 
     Storage::disk('images')->assertMissing('cache/photo.failed');
 });
 
+it('treats a timeout as transient', function () {
+    Http::fake(fn () => throw new ConnectionException('cURL error 28: timed out'));
+
+    $cache = makeImageCache();
+    $cache->warm('photo', 'https://1.1.1.1/photo.png');
+
+    $this->travel(3599)->seconds();
+    expect($cache->recentlyFailed('photo'))->toBeTrue();
+
+    $this->travel(2)->seconds();
+    expect($cache->recentlyFailed('photo'))->toBeFalse();
+});
+
+it('negative-caches a deterministic failure for the permanent failure ttl', function (int $status, string $type) {
+    Http::fake(['https://1.1.1.1/*' => Http::response('nope', $status, ['Content-Type' => $type])]);
+
+    $cache = makeImageCache();
+    $cache->warm('photo', 'https://1.1.1.1/photo.png');
+
+    $this->travel(7 * 86400 - 1)->seconds();
+    expect($cache->recentlyFailed('photo'))->toBeTrue()
+        ->and($cache->warm('photo', 'https://1.1.1.1/photo.png'))->toBeFalse();
+    Http::assertSentCount(1);
+
+    $this->travel(2)->seconds();
+    expect($cache->recentlyFailed('photo'))->toBeFalse();
+})->with([
+    '404' => [404, 'text/html'],
+    '410' => [410, 'text/html'],
+    'non-image' => [200, 'text/plain'],
+]);
+
+it('honours a longer Retry-After on a 429, in seconds or as an HTTP date', function (string $retryAfter) {
+    Http::fake(['https://1.1.1.1/*' => Http::response('', 429, ['Retry-After' => $retryAfter])]);
+
+    $cache = makeImageCache();
+    $cache->warm('photo', 'https://1.1.1.1/photo.png');
+
+    $this->travel(7199)->seconds();
+    expect($cache->recentlyFailed('photo'))->toBeTrue();
+
+    $this->travel(2)->seconds();
+    expect($cache->recentlyFailed('photo'))->toBeFalse();
+})->with([
+    'seconds' => ['7200'],
+    'http date' => [fn () => now()->addSeconds(7200)->toRfc7231String()],
+]);
+
+it('ignores Retry-After when the failure ttl is 0', function () {
+    config()->set('image-cache.failure_ttl', 0);
+    Http::fake(['https://1.1.1.1/*' => Http::response('', 429, ['Retry-After' => '7200'])]);
+
+    $cache = makeImageCache();
+    $cache->warm('photo', 'https://1.1.1.1/photo.png');
+    $cache->warm('photo', 'https://1.1.1.1/photo.png');
+
+    Http::assertSentCount(2);
+    Storage::disk('images')->assertMissing('cache/photo.failed');
+});
+
+it('falls back to the failure ttl for an unparsable Retry-After', function () {
+    Http::fake(['https://1.1.1.1/*' => Http::response('', 429, ['Retry-After' => 'soon'])]);
+
+    $cache = makeImageCache();
+    $cache->warm('photo', 'https://1.1.1.1/photo.png');
+
+    $this->travel(3599)->seconds();
+    expect($cache->recentlyFailed('photo'))->toBeTrue();
+
+    $this->travel(2)->seconds();
+    expect($cache->recentlyFailed('photo'))->toBeFalse();
+});
+
+it('caps a hostile Retry-After at the permanent failure ttl', function () {
+    Http::fake(['https://1.1.1.1/*' => Http::response('', 429, ['Retry-After' => '999999999'])]);
+
+    $cache = makeImageCache();
+    $cache->warm('photo', 'https://1.1.1.1/photo.png');
+
+    $this->travel(7 * 86400 + 1)->seconds();
+    expect($cache->recentlyFailed('photo'))->toBeFalse();
+});
+
+it('keeps honouring a marker written before failures were classified', function () {
+    Storage::disk('images')->put('cache/photo.failed', (string) now()->subMinutes(30)->timestamp);
+
+    $cache = makeImageCache();
+
+    expect($cache->recentlyFailed('photo'))->toBeTrue();
+
+    $this->travel(31)->minutes();
+    expect($cache->recentlyFailed('photo'))->toBeFalse();
+});
+
 it('retries every time when the failure ttl is 0', function () {
     config()->set('image-cache.failure_ttl', 0);
-    Http::fake(['https://1.1.1.1/*' => Http::response('', 404)]);
+    Http::fake(['https://1.1.1.1/*' => Http::response('', 500)]);
 
     $cache = makeImageCache();
     $cache->warm('photo', 'https://1.1.1.1/photo.png');
@@ -372,7 +467,7 @@ it('serves the just-warmed bytes only once from memory', function () {
     expect($calls->getArrayCopy())->toBe(['get cache/blobs/'.hash('sha256', 'binary-image-data')]);
 });
 
-it('serves a miss with two HEADs and two PUTs, and no read back', function () {
+it('serves a miss with a HEAD, a marker read and two PUTs, and no read back', function () {
     Http::fake(['https://1.1.1.1/*' => Http::response('binary-image-data', 200, ['Content-Type' => 'image/png'])]);
 
     $calls = spyOnImagesDisk();
@@ -382,7 +477,7 @@ it('serves a miss with two HEADs and two PUTs, and no read back', function () {
         ->and($cache->response('photo')->getContent())->toBe('binary-image-data')
         ->and($calls->getArrayCopy())->toBe([
             'lastModified cache/photo',
-            'lastModified cache/photo.failed',
+            'get cache/photo.failed',
             'put cache/blobs/'.hash('sha256', 'binary-image-data'),
             'put cache/photo',
         ]);

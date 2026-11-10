@@ -29,12 +29,17 @@ return [
     | Failure TTL
     |--------------------------------------------------------------------------
     |
-    | After a failed fetch (404, non-image, network error...), warm() skips the
-    | upstream for this many seconds instead of retrying on every request.
-    | Set to 0 to retry every time.
+    | After a failed fetch, warm() skips the upstream instead of retrying on
+    | every request. failure_ttl covers transient failures (timeout, 5xx, 403,
+    | 429...); a 429/503 Retry-After longer than it is honoured.
+    | permanent_failure_ttl covers failures a retry won't fix (404, 410,
+    | non-image, oversized). Set either to 0 to retry that class every time;
+    | failure_ttl = 0 also ignores Retry-After.
     |
     */
     'failure_ttl' => (int) env('IMAGE_CACHE_FAILURE_TTL', 3600),
+
+    'permanent_failure_ttl' => (int) env('IMAGE_CACHE_PERMANENT_FAILURE_TTL', 7 * 86400),
 
     /*
     |--------------------------------------------------------------------------
